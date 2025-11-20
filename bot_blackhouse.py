@@ -245,16 +245,9 @@ async def enviar_questoes_noite(context):
 
 
 async def comando_teste_lote(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.job_queue.run_once(
-        lambda ctx: enviar_lote_topico(ctx, "Penal"),
-        when=0
-    )
-    await update.message.reply_text("Enviando lote de teste (Penal) agora!")
-
-
-# =======================
-# RECEBIMENTO DE RESPOSTAS (RANKING)
-# =======================
+    await update.message.reply_text("Enviando 10 questões agora...")
+    await enviar_lote_topico(context, "Penal")
+    await update.message.reply_text("Lote enviado!")
 
 async def receber_resposta(update: Update, context: ContextTypes.DEFAULT_TYPE):
     answer = update.poll_answer
