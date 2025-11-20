@@ -2,7 +2,7 @@ import os
 import random
 import json
 from pathlib import Path
-from datetime import time
+from datetime import time, datetime
 
 import pytz
 import requests
@@ -28,6 +28,36 @@ QUESTIONS_API_URL = os.getenv("QUESTIONS_API_URL", "")
 TOPICO_MANHA = "Penal"
 TOPICO_TARDE = "Constitucional"
 TOPICO_NOITE = "Administrativo"
+
+DAY_CYCLE = [
+    {
+        "manha": "Direito Penal",
+        "tarde": "Direito Constitucional",
+        "noite": "Direito Administrativo",
+    },
+    {
+        "manha": "Lei de Execução Penal",
+        "tarde": "Informática",
+        "noite": "Língua Portuguesa",
+    },
+    {
+        "manha": "Raciocínio Lógico",
+        "tarde": "Contabilidade",
+        "noite": "Legislação Extravagante",
+    },
+]
+
+
+def obter_topico_do_periodo(periodo: str) -> str:
+    """Retorna o tópico do dia para o período (manha/tarde/noite).
+
+    O ciclo é de 3 dias e se baseia no dia da semana (weekday):
+    segunda = dia 1, terça = dia 2, quarta = dia 3, depois repete.
+    """
+    agora = datetime.now(TZ)
+    idx = agora.weekday() % 3  # 0,1,2
+    ciclo = DAY_CYCLE[idx]
+    return ciclo.get(periodo, "Direito Penal")
 
 # Arquivo de pontuações (ranking)
 SCORES_FILE = Path("scores.json")
@@ -233,21 +263,27 @@ async def enviar_lote_topico(context: ContextTypes.DEFAULT_TYPE, topico: str):
 
 
 async def enviar_questoes_manha(context):
-    await enviar_lote_topico(context, TOPICO_MANHA)
+    topico = obter_topico_do_periodo("manha")
+    await enviar_lote_topico(context, topico)
 
 
 async def enviar_questoes_tarde(context):
-    await enviar_lote_topico(context, TOPICO_TARDE)
+    topico = obter_topico_do_periodo("tarde")
+    await enviar_lote_topico(context, topico)
 
 
 async def enviar_questoes_noite(context):
-    await enviar_lote_topico(context, TOPICO_NOITE)
+    topico = obter_topico_do_periodo("noite")
+    await enviar_lote_topico(context, topico)
 
 
 async def comando_teste_lote(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Enviando 10 questões agora...")
-    await enviar_lote_topico(context, "Penal")
+    await update.message.reply_text("Enviando 10 questões de Direito Penal agora...")
+    await enviar_lote_topico(context, "Direito Penal")
     await update.message.reply_text("Lote enviado!")
+# =======================
+# RECEBIMENTO DE RESPOSTAS (RANKING)
+# =======================
 
 async def receber_resposta(update: Update, context: ContextTypes.DEFAULT_TYPE):
     answer = update.poll_answer
