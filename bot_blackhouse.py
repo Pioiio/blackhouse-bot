@@ -38,17 +38,12 @@ ROTACAO = {
 }
 
 def obter_dia_rotacao():
-    """
-    Dia 1 = (data % 3 == 1)
-    Dia 2 = (data % 3 == 2)
-    Dia 3 = (data % 3 == 0)
-    """
     dia_mes = datetime.now(TZ).day
     resto = dia_mes % 3
     return 3 if resto == 0 else resto
 
 # ----------------------------------------------------------
-# FUNÇÃO DE BUSCAR QUESTÕES DA API
+# BUSCAR QUESTÕES
 # ----------------------------------------------------------
 def buscar_questoes(topico):
     try:
@@ -67,7 +62,7 @@ def buscar_questoes(topico):
         return []
 
 # ----------------------------------------------------------
-# ENVIO DE LOTE (COM DEBUG SE HOUVER ERRO)
+# ENVIO DE LOTE
 # ----------------------------------------------------------
 async def enviar_lote_topico(context, topico):
     questoes = buscar_questoes(topico)
@@ -86,13 +81,11 @@ async def enviar_lote_topico(context, topico):
                 options=q["opcoes"],
                 correct_option_id=q["opcoes"].index(q["correta"]),
                 explanation=q.get("comentario", "Sem comentário."),
-                is_anonymous=False
+                is_anonymous=True   # ← ALTERAÇÃO CRUCIAL
             )
         except Exception as e:
             logger.error("ERRO AO ENVIAR ENQUETE:")
-            logger.error(f"Tipo: {type(e)}")
-            logger.error(f"Detalhes: {e}")
-            # também envia mensagem para o canal para ver o erro
+            logger.error(f"ERRO: {e}")
             await context.bot.send_message(
                 chat_id=CHANNEL_ID,
                 text=f"❌ ERRO ao enviar enquete:\n`{e}`",
@@ -100,7 +93,7 @@ async def enviar_lote_topico(context, topico):
             )
 
 # ----------------------------------------------------------
-# COMANDO MANUAL /testelote (ENVIA NA HORA)
+# /testelote
 # ----------------------------------------------------------
 async def comando_teste_lote(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Enviando 10 questões agora (Direito Penal)...")
@@ -108,7 +101,7 @@ async def comando_teste_lote(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await update.message.reply_text("Lote enviado!")
 
 # ----------------------------------------------------------
-# AGENDA AUTOMÁTICA (08h / 15h / 20h)
+# AGENDAMENTO AUTOMÁTICO
 # ----------------------------------------------------------
 def configurar_agendamentos(app):
     dia = obter_dia_rotacao()
@@ -153,7 +146,7 @@ def main():
 
     configurar_agendamentos(app)
 
-    logger.info("BOT BLACK HOUSE INICIADO NO RAILWAY...")
+    logger.info("BOT BLACK HOUSE INICIADO...")
     app.run_polling()
 
 if __name__ == "__main__":
