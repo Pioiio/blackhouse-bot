@@ -1,379 +1,160 @@
 import os
-import random
-import json
-from pathlib import Path
-from datetime import time, datetime
-
-import pytz
 import requests
+import pytz
+from datetime import datetime, time
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
     ContextTypes,
-    PollAnswerHandler,
 )
+import logging
 
-# =======================
-# CONFIGURAÇÕES BÁSICAS
-# =======================
+# ----------------------------------------------------------
+# CONFIGURAÇÃO DE LOGS (MOSTRA ERROS NO RAILWAY)
+# ----------------------------------------------------------
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "COLOQUE_SEU_TOKEN_AQUI")
-CHANNEL_ID = int(os.getenv("CHANNEL_ID", "-1001234567890"))
+# ----------------------------------------------------------
+# VARIÁVEIS DE AMBIENTE
+# ----------------------------------------------------------
+TOKEN = os.getenv("TELEGRAM_TOKEN")
+CHANNEL_ID = os.getenv("CHANNEL_ID")
+QUESTIONS_API_URL = os.getenv("QUESTIONS_API_URL")
 
-# URL da API externa de questões (você vai criar/fornecer)
-QUESTIONS_API_URL = os.getenv("QUESTIONS_API_URL", "")
-
-# Tópicos padrão por período
-TOPICO_MANHA = "Penal"
-TOPICO_TARDE = "Constitucional"
-TOPICO_NOITE = "Administrativo"
-
-DAY_CYCLE = [
-    {
-        "manha": "Direito Penal",
-        "tarde": "Direito Constitucional",
-        "noite": "Direito Administrativo",
-    },
-    {
-        "manha": "Lei de Execução Penal",
-        "tarde": "Informática",
-        "noite": "Língua Portuguesa",
-    },
-    {
-        "manha": "Raciocínio Lógico",
-        "tarde": "Contabilidade",
-        "noite": "Legislação Extravagante",
-    },
-]
-
-
-def obter_topico_do_periodo(periodo: str) -> str:
-    """Retorna o tópico do dia para o período (manha/tarde/noite).
-
-    O ciclo é de 3 dias e se baseia no dia da semana (weekday):
-    segunda = dia 1, terça = dia 2, quarta = dia 3, depois repete.
-    """
-    agora = datetime.now(TZ)
-    idx = agora.weekday() % 3  # 0,1,2
-    ciclo = DAY_CYCLE[idx]
-    return ciclo.get(periodo, "Direito Penal")
-
-# Arquivo de pontuações (ranking)
-SCORES_FILE = Path("scores.json")
-
-# Fuso horário Brasil
 TZ = pytz.timezone("America/Sao_Paulo")
 
+# ----------------------------------------------------------
+# CICLO DE MATÉRIAS (Dia 1, Dia 2, Dia 3)
+# ----------------------------------------------------------
+ROTACAO = {
+    1: ["Penal", "Constitucional", "Administrativo"],
+    2: ["Lei de Execução Penal", "Informática", "Língua Portuguesa"],
+    3: ["Raciocínio Lógico", "Contabilidade", "Legislação Extravagante"]
+}
 
-# =======================
-# BANCO LOCAL DE QUESTÕES (FALLBACK)
-# =======================
+def obter_dia_rotacao():
+    """
+    Dia 1 = (data % 3 == 1)
+    Dia 2 = (data % 3 == 2)
+    Dia 3 = (data % 3 == 0)
+    """
+    dia_mes = datetime.now(TZ).day
+    resto = dia_mes % 3
+    return 3 if resto == 0 else resto
 
-QUESTOES_EXEMPLO = [
-    {
-        "pergunta": "Sobre o princípio da legalidade, assinale a alternativa correta:",
-        "opcoes": [
-            "A administração pública pode agir livremente, salvo proibição legal.",
-            "O administrador público só pode fazer o que a lei permite.",
-            "O administrador público pode agir por analogia mesmo contra a lei.",
-            "A lei é mera recomendação para a administração."
-        ],
-        "correta": "O administrador público só pode fazer o que a lei permite.",
-        "comentario": "Administração só age com autorização legal. Particular faz tudo que não é proibido.",
-        "topico": "Administrativo"
-    },
-    {
-        "pergunta": "Qual é a natureza jurídica do habeas corpus?",
-        "opcoes": [
-            "Ação penal pública incondicionada.",
-            "Ação constitucional de natureza civil.",
-            "Recurso extraordinário.",
-            "Ação de controle concentrado de constitucionalidade."
-        ],
-        "correta": "Ação constitucional de natureza civil.",
-        "comentario": "Ação constitucional civil para proteger a liberdade de locomoção.",
-        "topico": "Constitucional"
-    },
-    {
-        "pergunta": "O crime permanente é aquele cuja consumação:",
-        "opcoes": [
-            "Ocorre em um único instante.",
-            "Depende de resultado naturalístico.",
-            "Se prolonga no tempo por vontade do agente.",
-            "Se dá sem qualquer conduta humana."
-        ],
-        "correta": "Se prolonga no tempo por vontade do agente.",
-        "comentario": "Crime permanente: consumação que se prolonga com a continuidade da conduta.",
-        "topico": "Penal"
-    },
-]
-
-
-# =======================
-# FUNÇÕES DE ALTA: RANKING
-# =======================
-
-def carregar_scores():
-    if SCORES_FILE.exists():
-        try:
-            with SCORES_FILE.open("r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            return {}
-    return {}
-
-
-def salvar_scores(scores: dict):
-    with SCORES_FILE.open("w", encoding="utf-8") as f:
-        json.dump(scores, f, ensure_ascii=False, indent=2)
-
-
-def registrar_acerto(user, topico: str, pontos: int = 1):
-    scores = carregar_scores()
-    uid = str(user.id)
-
-    nome = (f"{user.first_name or ''} {user.last_name or ''}").strip()
-    if not nome:
-        nome = user.username or uid
-
-    if uid not in scores:
-        scores[uid] = {"name": nome, "score": 0, "topics": {}}
-
-    scores[uid]["name"] = nome
-    scores[uid]["score"] += pontos
-
-    topics = scores[uid].get("topics", {})
-    topics[topico] = topics.get(topico, 0) + 1
-    scores[uid]["topics"] = topics
-
-    salvar_scores(scores)
-
-
-# =======================
-# BUSCA DE QUESTÕES (API + LOCAL)
-# =======================
-
-def buscar_questoes(qtd: int = 10, topico: str | None = None):
-    # ---- Tentativa de API externa ----
-    if QUESTIONS_API_URL:
-        try:
-            params = {"qtd": qtd}
-            if topico:
-                params["topico"] = topico
-
-            resp = requests.get(QUESTIONS_API_URL, params=params, timeout=10)
-            resp.raise_for_status()
-
-            dados = resp.json()
-            questoes_validas = []
-
-            for q in dados:
-                if not all(k in q for k in ("pergunta", "opcoes", "correta")):
-                    continue
-                if not isinstance(q["opcoes"], list) or len(q["opcoes"]) < 2:
-                    continue
-
-                questoes_validas.append({
-                    "pergunta": q["pergunta"],
-                    "opcoes": q["opcoes"],
-                    "correta": q["correta"],
-                    "comentario": q.get("comentario", ""),
-                    "topico": q.get("topico", topico or "Geral"),
-                })
-
-            if questoes_validas:
-                return random.sample(questoes_validas, min(qtd, len(questoes_validas)))
-
-        except Exception as e:
-            print(f"[WARN] API externa falhou: {e}")
-
-    # ---- Fallback: banco local ----
-    questoes_filtradas = (
-        [q for q in QUESTOES_EXEMPLO if q.get("topico") == topico]
-        if topico else QUESTOES_EXEMPLO[:]
-    )
-
-    if not questoes_filtradas:
-        questoes_filtradas = QUESTOES_EXEMPLO[:]
-
-    return random.sample(questoes_filtradas, min(qtd, len(questoes_filtradas)))
-
-
-# =======================
-# FUNÇÕES DO BOT
-# =======================
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Bot da Mentoria Black House ativo!\n\n"
-        "Use /ranking para consultar o ranking atual."
-    )
-
-
-async def comando_ranking(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    scores = carregar_scores()
-
-    if not scores:
-        await update.message.reply_text("Ainda não houve participações.")
-        return
-
-    ordenado = sorted(scores.items(), key=lambda x: x[1]["score"], reverse=True)
-
-    linhas = ["🏆 *Ranking Black House* 🏆\n"]
-    for pos, (uid, dados) in enumerate(ordenado[:10], start=1):
-        linhas.append(f"{pos}. {dados['name']} — *{dados['score']}* pts")
-
-    await update.message.reply_markdown("\n".join(linhas))
-
-
-async def enviar_lote_topico(context: ContextTypes.DEFAULT_TYPE, topico: str):
-    questoes = buscar_questoes(10, topico=topico)
-
-    for q in questoes:
-        opcoes = q["opcoes"]
-        correta = q["correta"]
-
-        try:
-            idx_correto = opcoes.index(correta)
-        except:
-            continue
-
-        comentario = q.get("comentario", "")
-        if len(comentario) > 200:
-            comentario = comentario[:197] + "..."
-
-        msg = await context.bot.send_poll(
-            chat_id=CHANNEL_ID,
-            question=q["pergunta"],
-            options=opcoes,
-            type="quiz",
-            correct_option_id=idx_correto,
-            is_anonymous=False,
-            explanation=comentario
+# ----------------------------------------------------------
+# FUNÇÃO DE BUSCAR QUESTÕES DA API
+# ----------------------------------------------------------
+def buscar_questoes(topico):
+    try:
+        resp = requests.get(
+            QUESTIONS_API_URL,
+            params={"qtd": 10, "topico": topico},
+            timeout=10
         )
+        if resp.status_code == 200:
+            return resp.json()
+        else:
+            logger.error(f"Erro API {resp.status_code}: {resp.text}")
+            return []
+    except Exception as e:
+        logger.error(f"Erro ao consultar API: {e}")
+        return []
 
-        poll_id = msg.poll.id
-        polls = context.bot_data.setdefault("polls", {})
-        polls[poll_id] = {
-            "correct_option_id": idx_correto,
-            "topico": topico,
-            "points": 1
-        }
-
-
-async def enviar_questoes_manha(context):
-    topico = obter_topico_do_periodo("manha")
-    await enviar_lote_topico(context, topico)
-
-
-async def enviar_questoes_tarde(context):
-    topico = obter_topico_do_periodo("tarde")
-    await enviar_lote_topico(context, topico)
-
-
-async def enviar_questoes_noite(context):
-    topico = obter_topico_do_periodo("noite")
-    await enviar_lote_topico(context, topico)
-
-
-async def comando_teste_lote(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Enviando 10 questões de Direito Penal agora...")
-    await enviar_lote_topico(context, "Direito Penal")
-    await update.message.reply_text("Lote enviado!")
-# =======================
-# RECEBIMENTO DE RESPOSTAS (RANKING)
-# =======================
-
-async def receber_resposta(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    answer = update.poll_answer
-    poll_id = answer.poll_id
-
-    polls = context.bot_data.get("polls", {})
-    meta = polls.get(poll_id)
-
-    if not meta:
-        return
-
-    chosen = answer.option_ids[0]
-    correto = meta["correct_option_id"]
-    topico = meta["topico"]
-
-    if chosen == correto:
-        registrar_acerto(answer.user, topico)
-
-
-# =======================
-# RESUMO SEMANAL (DOMINGO 21h)
-# =======================
-
-async def enviar_resumo_semanal(context: ContextTypes.DEFAULT_TYPE):
-    scores = carregar_scores()
-
-    if not scores:
+# ----------------------------------------------------------
+# ENVIO DE LOTE (COM DEBUG SE HOUVER ERRO)
+# ----------------------------------------------------------
+async def enviar_lote_topico(context, topico):
+    questoes = buscar_questoes(topico)
+    if not questoes:
         await context.bot.send_message(
             chat_id=CHANNEL_ID,
-            text="📊 Resumo semanal: sem participações registradas."
+            text=f"⚠ Não encontrei questões de {topico}."
         )
         return
 
-    ordenado = sorted(scores.items(), key=lambda x: x[1]["score"], reverse=True)
+    for q in questoes:
+        try:
+            await context.bot.send_poll(
+                chat_id=CHANNEL_ID,
+                question=q["pergunta"],
+                options=q["opcoes"],
+                correct_option_id=q["opcoes"].index(q["correta"]),
+                explanation=q.get("comentario", "Sem comentário."),
+                is_anonymous=False
+            )
+        except Exception as e:
+            logger.error("ERRO AO ENVIAR ENQUETE:")
+            logger.error(f"Tipo: {type(e)}")
+            logger.error(f"Detalhes: {e}")
+            # também envia mensagem para o canal para ver o erro
+            await context.bot.send_message(
+                chat_id=CHANNEL_ID,
+                text=f"❌ ERRO ao enviar enquete:\n`{e}`",
+                parse_mode="Markdown"
+            )
 
-    linhas = ["🏁 *Resumo semanal Black House* 🏁\n"]
-    linhas.append("Top 10 da semana:\n")
+# ----------------------------------------------------------
+# COMANDO MANUAL /testelote (ENVIA NA HORA)
+# ----------------------------------------------------------
+async def comando_teste_lote(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Enviando 10 questões agora (Direito Penal)...")
+    await enviar_lote_topico(context, "Penal")
+    await update.message.reply_text("Lote enviado!")
 
-    for pos, (uid, dados) in enumerate(ordenado[:10], start=1):
-        linhas.append(f"{pos}. {dados['name']} — *{dados['score']}* pts")
-
-    await context.bot.send_message(
-        chat_id=CHANNEL_ID,
-        text="\n".join(linhas),
-        parse_mode="Markdown"
-    )
-
-    salvar_scores({})
-
-
-# =======================
-# AGENDAMENTO
-# =======================
-
+# ----------------------------------------------------------
+# AGENDA AUTOMÁTICA (08h / 15h / 20h)
+# ----------------------------------------------------------
 def configurar_agendamentos(app):
-    job = app.job_queue
+    dia = obter_dia_rotacao()
+    topicos = ROTACAO[dia]
 
-    job.run_daily(enviar_questoes_manha, time=time(8, 0, tzinfo=TZ))
-    job.run_daily(enviar_questoes_tarde, time=time(15, 0, tzinfo=TZ))
-    job.run_daily(enviar_questoes_noite, time=time(20, 0, tzinfo=TZ))
-
-    job.run_daily(
-        enviar_resumo_semanal,
-        time=time(21, 0, tzinfo=TZ),
-        days=(6,),  # domingo
-        name="resumo_semanal"
+    app.job_queue.run_daily(
+        enviar_lote_topico,
+        time=time(8, 0, tzinfo=TZ),
+        data={"topico": topicos[0]}
     )
 
+    app.job_queue.run_daily(
+        enviar_lote_topico,
+        time=time(15, 0, tzinfo=TZ),
+        data={"topico": topicos[1]}
+    )
 
-# =======================
+    app.job_queue.run_daily(
+        enviar_lote_topico,
+        time=time(20, 0, tzinfo=TZ),
+        data={"topico": topicos[2]}
+    )
+
+# ----------------------------------------------------------
+# /start
+# ----------------------------------------------------------
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "🤖 Bot Black House ativo!\n"
+        "Use /testelote para enviar 10 questões agora.\n"
+        "Os envios automáticos estão configurados."
+    )
+
+# ----------------------------------------------------------
 # MAIN
-# =======================
-
+# ----------------------------------------------------------
 def main():
-    if TELEGRAM_TOKEN.startswith("COLOQUE_SEU_TOKEN"):
-        raise RuntimeError("Defina TELEGRAM_TOKEN.")
-
-    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+    app = ApplicationBuilder().token(TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("testelote", comando_teste_lote))
-    app.add_handler(CommandHandler("ranking", comando_ranking))
-
-    app.add_handler(PollAnswerHandler(receber_resposta))
 
     configurar_agendamentos(app)
 
-    print("Bot Black House rodando...")
+    logger.info("BOT BLACK HOUSE INICIADO NO RAILWAY...")
     app.run_polling()
-
 
 if __name__ == "__main__":
     main()
