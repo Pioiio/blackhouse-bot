@@ -227,14 +227,15 @@ async def enviar_lote(context: ContextTypes.DEFAULT_TYPE, topico: str, origem: s
             comentario = comentario[:197] + "..."
 
         msg = await context.bot.send_poll(
-            chat_id=CHANNEL_ID,
-            question=q["pergunta"],
-            options=opcoes,
-            type="quiz",
-            correct_option_id=idx_correta,
-            is_anonymous=False,
-            explanation=comentario,
-        )
+    chat_id=CHANNEL_ID,
+    question=q["pergunta"],
+    options=opcoes,
+    type="quiz",
+    correct_option_id=idx_correta,
+    is_anonymous=True,       # ✔ CORRETO para canal
+    explanation=comentario,
+)
+
 
         poll_id = msg.poll.id
         polls = context.bot_data.setdefault("polls", {})
