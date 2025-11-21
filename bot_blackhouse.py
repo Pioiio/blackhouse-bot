@@ -1,293 +1,226 @@
-"""
-Bot Black House – versão inteligente, compatível com python-telegram-bot v20.x
-
-Principais características:
-- Robusto, resiliente e precavido
-- API com retry, backoff, normalização de JSON e proteção contra repetição
-- Timezone correto via scheduler (compatível com PTB v20)
-- Jobs automáticos funcionando no Railway
-"""
-
+# bot_blackhouse.py
 from __future__ import annotations
 
 import logging
 import os
-import random
-import time as time_mod
-from dataclasses import dataclass
 from datetime import time
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import List, Dict, Any
 
+import httpx
 import pytz
-import requests
-from telegram import (
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    Update,
-)
+from telegram import Update
 from telegram.ext import (
-    Application,
     ApplicationBuilder,
-    CallbackQueryHandler,
+    Application,
     CommandHandler,
     ContextTypes,
-    JobQueue,
 )
 
-# ================================
-# LOGGING
-# ================================
 logging.basicConfig(
     format="[%(asctime)s] [%(levelname)s] %(name)s: %(message)s",
     level=logging.INFO,
 )
 logger = logging.getLogger("blackhouse-bot")
 
-# ================================
-# CONFIG
-# ================================
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 QUESTIONS_API_URL = os.getenv(
-    "QUESTIONS_API_URL", "https://blackhouse-api-production.up.railway.app/questoes"
+    "QUESTIONS_API_URL", "http://localhost:8000/questoes"
 ).strip()
 CANAL_ID = os.getenv("CANAL_ID", "@BLACKHOUSE_CONCURSOS").strip()
 
 TZ = pytz.timezone("America/Sao_Paulo")
 
-TOPICOS_LISTA = [
-    "Penal",
-    "Constitucional",
-    "Raciocínio Lógico",
-    "Processo Penal",
-    "Direitos Humanos",
-]
-
-HORARIOS_AUTOMATICOS = [
-    (time(8, 0), "Penal"),
-    (time(13, 0), "Constitucional"),
+TOPIC_SCHEDULES = [
+    (time(8, 0), "Direito Penal"),
+    (time(13, 0), "Direito Constitucional"),
     (time(19, 0), "Raciocínio Lógico"),
 ]
 
-FALLBACK_QUESTOES = [
-    {
-        "pergunta": "Fallback: Qual a capital do Brasil?",
-        "opcoes": ["Rio", "Brasília", "SP", "BH"],
-        "correta": 1,
-        "comentario": "Brasília é a capital desde 1960.",
-        "topico": "Geral",
-    },
-    {
-        "pergunta": "Fallback: 2 + 2 = ?",
-        "opcoes": ["3", "4", "5", "6"],
-        "correta": 1,
-        "comentario": "Operação básica.",
-        "topico": "Raciocínio Lógico",
-    },
-]
+QTD_POR_HORARIO = 10
 
-# ================================
-# MODELO DE QUESTÃO
-# ================================
-@dataclass(frozen=True)
-class Questao:
-    pergunta: str
-    opcoes: List[str]
-    correta: int
-    comentario: str
-    topico: str
 
-    @property
-    def chave(self) -> Tuple[str, int]:
-        return (self.pergunta.strip(), self.correta)
+class APIError(Exception):
+    pass
 
-# ================================
-# SERVIÇO DE QUESTÕES
-# ================================
-class QuestaoService:
 
-    def __init__(self, api_url: str):
-        self.api_url = api_url
-        self.historico_set: Set[Tuple[str, int]] = set()
-        self.historico_lista: List[Questao] = []
+async def buscar_questoes_api(
+    topico: str,
+    qtd: int = QTD_POR_HORARIO,
+) -> List[Dict[str, Any]]:
+    if not QUESTIONS_API_URL:
+        raise APIError("QUESTIONS_API_URL não configurada")
 
-    def _registrar(self, q: Questao) -> None:
-        if q.chave not in self.historico_set:
-            self.historico_set.add(q.chave)
-            self.historico_lista.append(q)
-            if len(self.historico_lista) > 500:
-                velho = self.historico_lista.pop(0)
-                if velho.chave in self.historico_set:
-                    self.historico_set.remove(velho.chave)
+    params = {"qtd": qtd, "topico": topico}
 
-    def _chamar_api(self, params: Dict[str, Any]) -> Any:
-        for tentativa in range(1, 4):
-            try:
-                resp = requests.get(self.api_url, params=params, timeout=10)
-                resp.raise_for_status()
-                return resp.json()
-            except Exception as e:
-                logger.warning("Erro API (%d): %s", tentativa, e)
-                time_mod.sleep(0.8 * tentativa)
-        return None
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        try:
+            resp = await client.get(QUESTIONS_API_URL, params=params)
+            resp.raise_for_status()
+        except Exception as e:
+            logger.error("Erro ao chamar API de questões: %s", e)
+            raise APIError(f"Erro na API: {e}")
 
-    def _normalizar(self, dados: Any, topico_padrao: Optional[str]) -> List[Questao]:
-        lista = []
+    dados = resp.json()
+    if not isinstance(dados, list):
+        raise APIError("Resposta inesperada da API (não é lista).")
 
-        if isinstance(dados, dict):
-            if all(k in dados for k in ("pergunta", "opcoes", "correta")):
-                dados = [dados]
-            elif "result" in dados:
-                dados = dados["result"]
-            elif "questoes" in dados:
-                dados = dados["questoes"]
+    questoes: List[Dict[str, Any]] = []
+    for item in dados:
+        try:
+            questoes.append(
+                {
+                    "id": int(item["id"]),
+                    "topico": str(item["topico"]),
+                    "pergunta": str(item["pergunta"]),
+                    "opcoes": list(item["opcoes"]),
+                    "correta": int(item["correta"]),
+                    "comentario": str(item.get("comentario", "")),
+                }
+            )
+        except Exception:
+            continue
 
-        if not isinstance(dados, list):
-            return []
+    if not questoes:
+        raise APIError("API não retornou questões válidas.")
 
-        for q in dados:
-            try:
-                pergunta = str(q["pergunta"])
-                opcoes = list(q["opcoes"])
-                correta = int(q["correta"])
-                comentario = q.get("comentario", "")
-                topico = q.get("topico", topico_padrao or "Geral")
-                questao = Questao(pergunta, opcoes, correta, comentario, topico)
-                lista.append(questao)
-            except Exception:
-                continue
+    return questoes
 
-        return lista
 
-    def buscar_lote(self, qtd: int, topico: Optional[str]) -> List[Questao]:
-        lote = []
-        vistos_local = set()
+async def job_enviar_lote(context: ContextTypes.DEFAULT_TYPE) -> None:
+    dados = context.job.data or {}
+    topico = dados.get("topico") or "Geral"
 
-        for _ in range(qtd * 3):
-            params = {"qtd": 1}
-            if topico:
-                params["topico"] = topico
+    logger.info("Job disparado para tópico: %s", topico)
 
-            dados = self._chamar_api(params)
-            if dados:
-                questoes = self._normalizar(dados, topico)
-            else:
-                questoes = []
+    try:
+        questoes = await buscar_questoes_api(topico=topico, qtd=QTD_POR_HORARIO)
+    except APIError as e:
+        logger.error("Falha ao obter questões (%s): %s", topico, e)
+        try:
+            await context.bot.send_message(
+                chat_id=CANAL_ID,
+                text=f"⚠️ Não foi possível carregar questões de *{topico}* agora.\nMotivo: {e}",
+                parse_mode="Markdown",
+            )
+        except Exception as ex:
+            logger.error("Falha ao enviar mensagem de erro no canal: %s", ex)
+        return
 
-            if not questoes:
-                continue
-
-            for q in questoes:
-                if q.chave in vistos_local:
-                    continue
-                if q.chave in self.historico_set:
-                    continue
-
-                vistos_local.add(q.chave)
-                lote.append(q)
-                self._registrar(q)
-
-                if len(lote) >= qtd:
-                    return lote
-
-        # Fallback
-        if not lote:
-            base = FALLBACK_QUESTOES[:]
-            for _ in range(qtd):
-                qd = random.choice(base)
-                q = Questao(
-                    qd["pergunta"], qd["opcoes"], qd["correta"],
-                    qd["comentario"], qd["topico"]
-                )
-                lote.append(q)
-                self._registrar(q)
-
-        return lote
-
-questao_service = QuestaoService(QUESTIONS_API_URL)
-
-# ================================
-# ENVIO DE QUESTÕES
-# ================================
-async def enviar_lote(context: ContextTypes.DEFAULT_TYPE, topico: str, origem: str):
-    questoes = questao_service.buscar_lote(10, topico)
+    try:
+        await context.bot.send_message(
+            chat_id=CANAL_ID,
+            text=f"📚 Matéria: *{topico}*\nSerão enviadas {len(questoes)} questões agora.",
+            parse_mode="Markdown",
+        )
+    except Exception as e:
+        logger.error("Erro ao enviar mensagem inicial do lote: %s", e)
 
     for q in questoes:
-        await context.bot.send_poll(
-            CANAL_ID,
-            f"[{q.topico}] {q.pergunta}",
-            q.opcoes,
-            type="quiz",
-            correct_option_id=q.correta,
-            explanation=q.comentario,
-            is_anonymous=False,
+        pergunta = f"[{q['topico']}] {q['pergunta']}"
+        try:
+            await context.bot.send_poll(
+                chat_id=CANAL_ID,
+                question=pergunta,
+                options=q["opcoes"],
+                type="quiz",
+                correct_option_id=q["correta"],
+                explanation=q["comentario"] or None,
+                is_anonymous=False,
+            )
+        except Exception as e:
+            logger.error("Erro ao enviar poll (id=%s): %s", q.get("id"), e)
+
+    logger.info("Lote enviado com sucesso para tópico: %s", topico)
+
+
+def configurar_jobs(app: Application) -> None:
+    scheduler = app.job_queue.scheduler
+    scheduler.configure(timezone=TZ)
+
+    for hora, topico in TOPIC_SCHEDULES:
+        app.job_queue.run_daily(
+            job_enviar_lote,
+            time=hora,
+            data={"topico": topico},
+            name=f"auto_{topico}",
         )
+        logger.info("Agendado horário %s para tópico %s", hora, topico)
 
-    logger.info("Lote enviado (%s) para %s", origem, topico)
 
-# ================================
-# COMANDOS
-# ================================
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    teclado = [
-        [InlineKeyboardButton(t, callback_data=f"TEMA|{t}")]
-        for t in TOPICOS_LISTA
-    ]
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    texto = (
+        "👊 *Black House Bot*\n\n"
+        "Este bot envia automaticamente lotes de questões no canal:\n"
+        f"{CANAL_ID}\n\n"
+        "Horários configurados:\n"
+        "• 08:00 – Direito Penal\n"
+        "• 13:00 – Direito Constitucional\n"
+        "• 19:00 – Raciocínio Lógico\n"
+        "\n"
+        "Cada horário: 10 questões, sem repetir até rodar o banco todo (controle pela API)."
+    )
+    await update.message.reply_text(texto, parse_mode="Markdown")
+
+
+async def cmd_testar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.args:
+        await update.message.reply_text(
+            "Use: /testar <matéria>\nEx: /testar \"Direito Penal\""
+        )
+        return
+
+    topico = " ".join(context.args)
     await update.message.reply_text(
-        "Escolha a matéria:",
-        reply_markup=InlineKeyboardMarkup(teclado)
+        f"Enviando lote de teste para matéria: {topico}"
     )
 
-async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Use /start para escolher uma matéria.")
+    class SimpleJob:
+        def __init__(self, topico):
+            self.data = {"topico": topico}
 
-# ================================
-# CALLBACKS
-# ================================
-async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    acao, valor = query.data.split("|", 1)
+    class SimpleContext:
+        def __init__(self, bot, job):
+            self.bot = bot
+            self.job = job
 
-    if acao == "TEMA":
-        await query.answer(f"Enviando questões de {valor}...")
-        await enviar_lote(context, valor, "manual")
+    fake_job = SimpleJob(topico)
+    fake_ctx = SimpleContext(context.bot, fake_job)
+    await job_enviar_lote(fake_ctx)
 
-# ================================
-# JOBS AUTOMÁTICOS
-# ================================
-async def job_enviar(context: ContextTypes.DEFAULT_TYPE):
-    topico = context.job.data["topico"]
-    await enviar_lote(context, topico, "automático")
 
-def configurar_jobs(job_queue: JobQueue):
-    for hora, topico in HORARIOS_AUTOMATICOS:
-        job_queue.run_daily(
-            job_enviar,
-            time=hora,
-            data={"topico": topico}
-        )
+def validar_config():
+    erros = []
+    if not TELEGRAM_TOKEN:
+        erros.append("TELEGRAM_TOKEN não configurado.")
+    if not CANAL_ID:
+        erros.append("CANAL_ID não configurado.")
+    if erros:
+        raise RuntimeError("Configuração inválida:\n- " + "\n- ".join(erros))
 
-# ================================
-# APLICAÇÃO
-# ================================
+
 def criar_app() -> Application:
-    # Criar app
-    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+    validar_config()
 
-    # >>> CORREÇÃO IMPORTANTE PARA RAILWAY <<<
-    app.job_queue.scheduler.configure(timezone=TZ)
+    app = (
+        ApplicationBuilder()
+        .token(TELEGRAM_TOKEN)
+        .build()
+    )
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_cmd))
-    app.add_handler(CallbackQueryHandler(callback_router))
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("testar", cmd_testar))
 
-    configurar_jobs(app.job_queue)
+    configurar_jobs(app)
 
     return app
 
+
 def main():
+    logger.info("Iniciando Bot Black House (PTB 21.6)...")
     app = criar_app()
-    logger.info("BOT ONLINE")
+    logger.info("Bot em modo polling.")
     app.run_polling()
+
 
 if __name__ == "__main__":
     main()
