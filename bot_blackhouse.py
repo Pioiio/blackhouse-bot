@@ -109,12 +109,53 @@ def registrar_acerto(user, topico: str, pontos: int = 1) -> None:
 
 def buscar_questoes(qtd: int = 10, topico: str | None = None) -> list:
     """
-    1) Tenta API com tópico
-    2) Se vier vazio, tenta API sem tópico (qualquer questão)
-    3) Se ainda assim vier vazio, usa fallback local
+    Nova lógica:
+    - Tenta montar um lote com até `qtd` questões.
+    - Aceita tanto resposta em LISTA quanto em DICT da API.
+    - Garante que só entram questões válidas e não repetidas (pergunta + correta).
+    - Se der tudo errado, usa o fallback local.
     """
 
-    def _chamar_api(params: dict) -> list:
+    def normalizar_resposta(dados, topico_padrao: str | None):
+        """Transforma o JSON da API em uma lista de questões válidas."""
+        questoes_validas = []
+
+        # Se vier um dict único com a questão
+        if isinstance(dados, dict):
+            # Caso 1: já seja uma questão
+            if all(k in dados for k in ("pergunta", "opcoes", "correta")):
+                dados = [dados]
+            # Caso 2: vindo dentro de uma chave tipo "result" / "questoes"
+            elif "result" in dados and isinstance(dados["result"], list):
+                dados = dados["result"]
+            elif "questoes" in dados and isinstance(dados["questoes"], list):
+                dados = dados["questoes"]
+            else:
+                return []
+
+        # Tem que ser lista a partir daqui
+        if not isinstance(dados, list):
+            return []
+
+        for q in dados:
+            if not isinstance(q, dict):
+                continue
+            if not all(k in q for k in ("pergunta", "opcoes", "correta")):
+                continue
+            if not isinstance(q["opcoes"], list) or len(q["opcoes"]) < 2:
+                continue
+
+            questoes_validas.append({
+                "pergunta": q["pergunta"],
+                "opcoes": q["opcoes"],
+                "correta": q["correta"],
+                "comentario": q.get("comentario", ""),
+                "topico": q.get("topico", topico_padrao or "Geral"),
+            })
+
+        return questoes_validas
+
+    def chamar_api(params: dict) -> list:
         if not QUESTIONS_API_URL:
             return []
         try:
@@ -125,47 +166,78 @@ def buscar_questoes(qtd: int = 10, topico: str | None = None) -> list:
             )
             resp.raise_for_status()
             dados = resp.json()
-            if isinstance(dados, dict) and "erro" in dados:
-                return []
-            if not isinstance(dados, list):
-                return []
-            questoes_validas = []
-            for q in dados:
-                if not all(k in q for k in ("pergunta", "opcoes", "correta")):
-                    continue
-                if not isinstance(q["opcoes"], list) or len(q["opcoes"]) < 2:
-                    continue
-                questoes_validas.append({
-                    "pergunta": q["pergunta"],
-                    "opcoes": q["opcoes"],
-                    "correta": q["correta"],
-                    "comentario": q.get("comentario", ""),
-                    "topico": q.get("topico", topico or "Geral"),
-                })
-            return questoes_validas
+            questoes = normalizar_resposta(dados, params.get("topico"))
+            return questoes or []
         except Exception as e:
             print(f"[WARN] Erro chamando API: {e}")
             return []
 
-    # 1) API com tópico
-    params = {"qtd": qtd}
-    if topico:
-        params["topico"] = topico
-    questoes = _chamar_api(params)
+    # ===================== MONTA O LOTE =====================
 
-    # 2) API sem tópico, se veio vazio
-    if not questoes:
-        questoes = _chamar_api({"qtd": qtd})
+    lote: list[dict] = []
+    vistos: set[tuple] = set()  # (pergunta, correta)
 
-    # 3) Fallback local
-    if not questoes:
+    # Faz várias tentativas para tentar variar as questões
+    tentativas_max = qtd * 3
+    tentativas = 0
+
+    while len(lote) < qtd and tentativas < tentativas_max:
+        tentativas += 1
+
+        params = {}
+        if topico:
+            params["topico"] = topico
+        params["qtd"] = 1  # muitas APIs entregam só 1 por vez, então chamamos várias vezes
+
+        questoes = chamar_api(params)
+        if not questoes:
+            break
+
+        for q in questoes:
+            chave = (q["pergunta"], q["correta"])
+            if chave in vistos:
+                continue
+            vistos.add(chave)
+            lote.append(q)
+            if len(lote) >= qtd:
+                break
+
+    # Se não conseguimos montar nada decente, tenta API sem tópico
+    if not lote:
+        tentativas = 0
+        while len(lote) < qtd and tentativas < tentativas_max:
+            tentativas += 1
+            questoes = chamar_api({"qtd": 1})
+            if not questoes:
+                break
+            for q in questoes:
+                chave = (q["pergunta"], q["correta"])
+                if chave in vistos:
+                    continue
+                vistos.add(chave)
+                lote.append(q)
+                if len(lote) >= qtd:
+                    break
+
+    # Se ainda assim estiver vazio, usa fallback local
+    if not lote:
         base = QUESTOES_FALLBACK[:]
         if topico:
-            base = [q for q in base if q.get("topico") == topico] or base
-        questoes = base
+            filtradas = [q for q in base if q.get("topico") == topico]
+            if filtradas:
+                base = filtradas
+        # repete fallback até encher o lote
+        while len(lote) < qtd:
+            q = random.choice(base)
+            chave = (q["pergunta"], q["correta"])
+            if chave in vistos:
+                continue
+            vistos.add(chave)
+            lote.append(q)
 
-    random.shuffle(questoes)
-    return questoes[:qtd]
+    random.shuffle(lote)
+    return lote[:qtd]
+
 
 
 # ============ COMANDOS BÁSICOS ============
