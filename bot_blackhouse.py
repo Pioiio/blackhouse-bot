@@ -1,204 +1,388 @@
 import os
 import json
+import random
+from pathlib import Path
+from datetime import time
+
 import requests
 import pytz
-from datetime import datetime, timedelta, time
-from telegram import Update
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+)
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
     ContextTypes,
+    PollAnswerHandler,
+    CallbackQueryHandler,
 )
-import logging
 
-# ----------------------------------------------------------
-# LOGS
-# ----------------------------------------------------------
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
-logger = logging.getLogger(__name__)
+# ============ CONFIGURAÇÕES BÁSICAS ============
 
-# ----------------------------------------------------------
-# VARIÁVEIS DE AMBIENTE
-# ----------------------------------------------------------
-TOKEN = os.getenv("TELEGRAM_TOKEN")
-CHANNEL_ID = os.getenv("CHANNEL_ID")
-QUESTIONS_API_URL = os.getenv("QUESTIONS_API_URL")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
+CHANNEL_ID = int(os.getenv("CHANNEL_ID", "0"))
+QUESTIONS_API_URL = os.getenv("QUESTIONS_API_URL", "").rstrip("/")
+
+# tópicos que existem no seu database.json
+TOPICOS_LISTA = [
+    "Penal",
+    "Constitucional",
+    "Administrativo",
+    "Português",
+    "Raciocínio Lógico",
+    "Processo Penal",
+    "Informática",
+    "Direitos Humanos",
+    "LEP",
+    "Legislação Extravagante",
+]
+
+# horários automáticos (pode ajustar depois)
 TZ = pytz.timezone("America/Sao_Paulo")
+HORARIOS_AUTOMATICOS = [
+    (time(8, 0, tzinfo=TZ), "Penal"),
+    (time(13, 0, tzinfo=TZ), "Constitucional"),
+    (time(19, 0, tzinfo=TZ), "Administrativo"),
+]
 
-# ----------------------------------------------------------
-# ROTACAO DAS 9 MATÉRIAS
-# ----------------------------------------------------------
-ROTACAO = {
-    1: ["Penal", "Constitucional", "Administrativo"],
-    2: ["Lei de Execução Penal", "Informática", "Língua Portuguesa"],
-    3: ["Raciocínio Lógico", "Contabilidade", "Legislação Extravagante"]
-}
+SCORES_FILE = Path("scores.json")
 
-def obter_dia_rotacao():
-    dia = datetime.now(TZ).day
-    resto = dia % 3
-    return 3 if resto == 0 else resto
+# Fallback local simples para caso a API morra de vez
+QUESTOES_FALLBACK = [
+    {
+        "pergunta": "O crime permanente é aquele cuja consumação:",
+        "opcoes": [
+            "Ocorre em um único instante.",
+            "Depende de resultado naturalístico.",
+            "Se prolonga no tempo por vontade do agente.",
+            "Se dá sem qualquer conduta humana."
+        ],
+        "correta": "Se prolonga no tempo por vontade do agente.",
+        "comentario": "Crime permanente: consumação que se prolonga no tempo por vontade do agente (ex.: sequestro).",
+        "topico": "Penal",
+    },
+]
 
-# ----------------------------------------------------------
-# CACHE PARA EVITAR REPETIÇÃO
-# ----------------------------------------------------------
-CACHE_FILE = "cache_questoes.json"
 
-def carregar_cache():
-    if os.path.exists(CACHE_FILE):
-        with open(CACHE_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
+# ============ UTILITÁRIOS DE SCORE / RANKING ============
+
+def carregar_scores() -> dict:
+    if SCORES_FILE.exists():
+        try:
+            return json.loads(SCORES_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
     return {}
 
-def salvar_cache(cache):
-    with open(CACHE_FILE, "w", encoding="utf-8") as f:
-        json.dump(cache, f, ensure_ascii=False, indent=2)
 
-def adicionar_cache(ids):
-    cache = carregar_cache()
-    hoje = datetime.now(TZ).strftime("%Y-%m-%d")
-    cache[hoje] = ids
+def salvar_scores(scores: dict) -> None:
+    SCORES_FILE.write_text(
+        json.dumps(scores, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
 
-    # remover dias com mais de 2 dias
-    dias_validos = []
-    for dia in cache:
-        dt = datetime.strptime(dia, "%Y-%m-%d")
-        if datetime.now(TZ) - dt <= timedelta(days=2):
-            dias_validos.append(dia)
 
-    cache = {dia: cache[dia] for dia in dias_validos}
-    salvar_cache(cache)
+def registrar_acerto(user, topico: str, pontos: int = 1) -> None:
+    scores = carregar_scores()
+    uid = str(user.id)
 
-def ids_ultimos_dois_dias():
-    cache = carregar_cache()
-    ids = []
-    for dia in cache:
-        ids.extend(cache[dia])
-    return ids
+    nome = (f"{user.first_name or ''} {user.last_name or ''}").strip()
+    if not nome:
+        nome = user.username or uid
 
-# ----------------------------------------------------------
-# BUSCAR QUESTÕES NA API
-# ----------------------------------------------------------
-def buscar_questoes(topico):
-    try:
-        resp = requests.get(
-            QUESTIONS_API_URL,
-            params={"qtd": 100, "topico": topico},
-            timeout=10
-        )
+    if uid not in scores:
+        scores[uid] = {"name": nome, "score": 0, "topics": {}}
 
-        if resp.status_code != 200:
-            logger.error(f"Erro API {resp.status_code}")
+    scores[uid]["name"] = nome
+    scores[uid]["score"] += pontos
+
+    topics = scores[uid].get("topics", {})
+    topics[topico] = topics.get(topico, 0) + 1
+    scores[uid]["topics"] = topics
+
+    salvar_scores(scores)
+
+
+# ============ BUSCA DE QUESTÕES (API + FALLBACK) ============
+
+def buscar_questoes(qtd: int = 10, topico: str | None = None) -> list:
+    """
+    1) Tenta API com tópico
+    2) Se vier vazio, tenta API sem tópico (qualquer questão)
+    3) Se ainda assim vier vazio, usa fallback local
+    """
+
+    def _chamar_api(params: dict) -> list:
+        if not QUESTIONS_API_URL:
+            return []
+        try:
+            resp = requests.get(
+                QUESTIONS_API_URL,
+                params=params,
+                timeout=10,
+            )
+            resp.raise_for_status()
+            dados = resp.json()
+            if isinstance(dados, dict) and "erro" in dados:
+                return []
+            if not isinstance(dados, list):
+                return []
+            questoes_validas = []
+            for q in dados:
+                if not all(k in q for k in ("pergunta", "opcoes", "correta")):
+                    continue
+                if not isinstance(q["opcoes"], list) or len(q["opcoes"]) < 2:
+                    continue
+                questoes_validas.append({
+                    "pergunta": q["pergunta"],
+                    "opcoes": q["opcoes"],
+                    "correta": q["correta"],
+                    "comentario": q.get("comentario", ""),
+                    "topico": q.get("topico", topico or "Geral"),
+                })
+            return questoes_validas
+        except Exception as e:
+            print(f"[WARN] Erro chamando API: {e}")
             return []
 
-        banco = resp.json()
+    # 1) API com tópico
+    params = {"qtd": qtd}
+    if topico:
+        params["topico"] = topico
+    questoes = _chamar_api(params)
 
-        # filtrar por substring (Penal detecta Direito Penal etc.)
-        banco = [
-            q for q in banco
-            if topico.lower() in q.get("topico", "").lower()
-        ]
-
-        return banco
-
-    except Exception as e:
-        logger.error(f"Erro API: {e}")
-        return []
-
-# ----------------------------------------------------------
-# SERVIR O LOTE
-# ----------------------------------------------------------
-async def enviar_lote_topico(context, topico):
-
-    questoes = buscar_questoes(topico)
+    # 2) API sem tópico, se veio vazio
     if not questoes:
+        questoes = _chamar_api({"qtd": qtd})
+
+    # 3) Fallback local
+    if not questoes:
+        base = QUESTOES_FALLBACK[:]
+        if topico:
+            base = [q for q in base if q.get("topico") == topico] or base
+        questoes = base
+
+    random.shuffle(questoes)
+    return questoes[:qtd]
+
+
+# ============ COMANDOS BÁSICOS ============
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "🔥 Bot da Mentoria Black House ativo!\n\n"
+        "Comandos principais:\n"
+        "/testar – escolher matéria e mandar questões agora\n"
+        "/ranking – ver ranking de acertos\n"
+        "/testelote – teste rápido (Penal)\n"
+    )
+
+
+async def cmd_ranking(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    scores = carregar_scores()
+    if not scores:
+        await update.message.reply_text("Ainda não há participações registradas.")
+        return
+
+    ordenado = sorted(scores.items(), key=lambda x: x[1]["score"], reverse=True)
+    linhas = ["🏆 *Ranking Black House* 🏆\n"]
+    for pos, (_, dados) in enumerate(ordenado[:10], start=1):
+        linhas.append(f"{pos}. {dados['name']} — *{dados['score']}* pts")
+
+    await update.message.reply_markdown("\n".join(linhas))
+
+
+# ============ ENVIO DE QUESTÕES ============
+
+async def enviar_lote(context: ContextTypes.DEFAULT_TYPE, topico: str, origem: str):
+    """
+    origem: 'auto' ou 'manual' (só para log/controle se quiser no futuro)
+    """
+    print(f"[INFO] Enviando lote para tópico '{topico}' (origem={origem})")
+
+    questoes = buscar_questoes(10, topico=topico)
+
+    if not questoes:
+        # Com o fallback novo isso é quase impossível, mas deixo por segurança
         await context.bot.send_message(
             chat_id=CHANNEL_ID,
-            text=f"⚠ Não encontrei questões de {topico}."
+            text=f"⚠️ Não encontrei questões de {topico}.",
         )
         return
 
-    # evitar repetição
-    repetidas = set(ids_ultimos_dois_dias())
+    for q in questoes:
+        opcoes = q["opcoes"]
+        correta = q["correta"]
 
-    questoes_filtradas = [
-        q for q in questoes
-        if q["pergunta"] not in repetidas
+        try:
+            idx_correta = opcoes.index(correta)
+        except ValueError:
+            # pular questão mal formatada
+            continue
+
+        comentario = q.get("comentario", "")
+        if len(comentario) > 200:
+            comentario = comentario[:197] + "..."
+
+        msg = await context.bot.send_poll(
+            chat_id=CHANNEL_ID,
+            question=q["pergunta"],
+            options=opcoes,
+            type="quiz",
+            correct_option_id=idx_correta,
+            is_anonymous=False,
+            explanation=comentario,
+        )
+
+        poll_id = msg.poll.id
+        polls = context.bot_data.setdefault("polls", {})
+        polls[poll_id] = {
+            "correct_option_id": idx_correta,
+            "topico": q.get("topico", topico),
+            "points": 1,
+        }
+
+
+# usados pelo agendamento automático
+async def job_enviar(context: ContextTypes.DEFAULT_TYPE):
+    dados = context.job.data  # {"topico": "..."}
+    topico = dados["topico"]
+    await enviar_lote(context, topico, origem="auto")
+
+
+# comando de teste manual rápido
+async def cmd_testelote(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Enviando lote de teste (Penal) para o canal...")
+    await enviar_lote(context, "Penal", origem="manual")
+
+
+# ============ /testar → MENU DE MATÉRIAS ============
+
+async def cmd_testar(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = [
+        [InlineKeyboardButton(top, callback_data=f"TESTAR|{top}")]
+        for top in TOPICOS_LISTA
     ]
 
-    # Se não houver 10 limpas, envia o que tem
-    lote = questoes_filtradas[:10]
-
-    if not lote:
-        lote = questoes[:10]
-
-    # salvar no cache
-    enviados = [q["pergunta"] for q in lote]
-    adicionar_cache(enviados)
-
-    # enviar
-    for q in lote:
-        try:
-            await context.bot.send_poll(
-                chat_id=CHANNEL_ID,
-                question=q["pergunta"],
-                options=q["opcoes"],
-                correct_option_id=q["opcoes"].index(q["correta"]),
-                explanation=q["comentario"][:180],  # evitar limite do Telegram
-                is_anonymous=True
-            )
-        except Exception as e:
-            await context.bot.send_message(
-                chat_id=CHANNEL_ID,
-                text=f"❌ ERRO ao enviar enquete:\n`{e}`",
-                parse_mode="Markdown"
-            )
-            logger.error(e)
-
-# ----------------------------------------------------------
-# /testelote
-# ----------------------------------------------------------
-async def comando_teste_lote(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await enviar_lote_topico(context, "Penal")
-    await update.message.reply_text("Lote enviado!")
-
-# ----------------------------------------------------------
-# AGENDA AUTOMÁTICA
-# ----------------------------------------------------------
-def configurar_agendamentos(app):
-    dia = obter_dia_rotacao()
-    topicos = ROTACAO[dia]
-
-    app.job_queue.run_daily(enviar_lote_topico, time=time(8, 0, tzinfo=TZ), data={"topico": topicos[0]})
-    app.job_queue.run_daily(enviar_lote_topico, time=time(15, 0, tzinfo=TZ), data={"topico": topicos[1]})
-    app.job_queue.run_daily(enviar_lote_topico, time=time(20, 0, tzinfo=TZ), data={"topico": topicos[2]})
-
-# ----------------------------------------------------------
-# /start
-# ----------------------------------------------------------
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🤖 Bot Black House ativo!\n"
-        "Use /testelote para enviar 10 questões agora.\n"
-        "Envios automáticos configurados."
+        "Selecione a matéria:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
     )
 
-# ----------------------------------------------------------
-# MAIN
-# ----------------------------------------------------------
+
+async def cb_botoes(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    data = query.data or ""
+    if data.startswith("TESTAR|"):
+        topico = data.split("|", 1)[1]
+        await query.edit_message_text(
+            f"🔍 Disparando questões de *{topico}*...",
+            parse_mode="Markdown",
+        )
+        await enviar_lote(context, topico, origem="manual")
+
+
+# ============ RESPOSTAS DOS ALUNOS (RANKING) ============
+
+async def handle_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    answer = update.poll_answer
+    poll_id = answer.poll_id
+
+    polls = context.bot_data.get("polls", {})
+    meta = polls.get(poll_id)
+    if not meta:
+        return
+
+    chosen = answer.option_ids[0]
+    correto = meta["correct_option_id"]
+    topico = meta["topico"]
+
+    if chosen == correto:
+        registrar_acerto(answer.user, topico)
+
+
+# ============ RESUMO SEMANAL (OPCIONAL) ============
+
+async def job_resumo_semanal(context: ContextTypes.DEFAULT_TYPE):
+    scores = carregar_scores()
+    if not scores:
+        await context.bot.send_message(
+            chat_id=CHANNEL_ID,
+            text="📊 Resumo semanal: ainda não há participações registradas.",
+        )
+        return
+
+    ordenado = sorted(scores.items(), key=lambda x: x[1]["score"], reverse=True)
+
+    linhas = ["🏁 *Resumo semanal Black House* 🏁\n", "Top 10:\n"]
+    for pos, (_, dados) in enumerate(ordenado[:10], start=1):
+        linhas.append(f"{pos}. {dados['name']} — *{dados['score']}* pts")
+
+    await context.bot.send_message(
+        chat_id=CHANNEL_ID,
+        text="\n".join(linhas),
+        parse_mode="Markdown",
+    )
+
+    # se quiser zerar semanalmente, descomente:
+    # salvar_scores({})
+
+
+# ============ AGENDAMENTOS ============
+
+def configurar_agendamentos(app):
+    job_queue = app.job_queue
+
+    # horários de questões automáticas
+    for hora, topico in HORARIOS_AUTOMATICOS:
+        job_queue.run_daily(
+            job_enviar,
+            time=hora,
+            data={"topico": topico},
+            name=f"lote_{topico}_{hora.hour}",
+        )
+
+    # resumo semanal no domingo às 21h (opcional)
+    job_queue.run_daily(
+        job_resumo_semanal,
+        time=time(21, 0, tzinfo=TZ),
+        days=(6,),  # domingo
+        name="resumo_semanal",
+    )
+
+
+# ============ MAIN ============
+
 def main():
-    app = ApplicationBuilder().token(TOKEN).build()
+    if not TELEGRAM_TOKEN:
+        raise RuntimeError("Defina TELEGRAM_TOKEN nas variáveis de ambiente.")
+    if CHANNEL_ID == 0:
+        raise RuntimeError("Defina CHANNEL_ID nas variáveis de ambiente.")
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("testelote", comando_teste_lote))
+    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
+    # comandos
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("ranking", cmd_ranking))
+    app.add_handler(CommandHandler("testelote", cmd_testelote))
+    app.add_handler(CommandHandler("testar", cmd_testar))
+
+    # callback dos botões
+    app.add_handler(CallbackQueryHandler(cb_botoes))
+
+    # respostas das enquetes
+    app.add_handler(PollAnswerHandler(handle_poll_answer))
+
+    # agendamentos
     configurar_agendamentos(app)
 
-    logger.info("BOT BLACK HOUSE INICIADO...")
+    print("Bot Black House rodando...")
     app.run_polling()
+
 
 if __name__ == "__main__":
     main()
